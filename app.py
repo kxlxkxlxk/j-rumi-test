@@ -16,16 +16,21 @@ GITHUB_REPO 설정 필요 -- 아래 read_shades() 참고). 환경변수가 아�
 import json
 import os
 import traceback
+import uuid
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import cv2
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import Body, FastAPI, Header, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from src.calibration import apply_correction, calibrate_from_image, capture_card_reference
+from src.color_match import rgb_to_lab
 from src.recommend import recommend_foundation
 from src import github_storage
+from src import reference_colors
 
 app = FastAPI()
 
@@ -81,14 +86,191 @@ def health():
 @app.get("/api/shades")
 def api_shades():
     shades, source = load_shades()
-    n_verified = sum(1 for s in shades if s.get("verified", True))
+    enriched = [{**s, "verified": s.get("verified", True)} for s in shades]
+    n_verified = sum(1 for s in enriched if s["verified"])
     return {
         "source": source,
-        "total": len(shades),
+        "total": len(enriched),
         "n_verified": n_verified,
-        "n_unverified": len(shades) - n_verified,
-        "shades": shades,
+        "n_unverified": len(enriched) - n_verified,
+        "shades": enriched,
     }
+
+
+# ---------------------------------------------------------------------------
+# 관리자 전용 -- 색상 DB 추가/삭제, 카드 기준값 재설정.
+# 원래 Streamlit 버전의 pages/1_관리자.py 를 API 형태로 옮긴 거예요. 화면(UI)은
+# 프론트엔드(Next.js) /admin 페이지 쪽에 있고, 여기는 그 화면이 호출하는
+# 실제 처리 로직이에요.
+#
+# 비밀번호는 Vercel 환경변수 ADMIN_PASSWORD 에 설정해두면, 모든 관리자
+# 요청에 담겨오는 X-Admin-Password 헤더 값과 비교해서 확인해요.
+# ---------------------------------------------------------------------------
+
+
+def _require_admin(x_admin_password: Optional[str]):
+    expected = os.environ.get("ADMIN_PASSWORD")
+    if not expected:
+        raise HTTPException(status_code=500, detail="서버에 ADMIN_PASSWORD 환경변수가 설정되어 있지 않아요")
+    if not x_admin_password or x_admin_password != expected:
+        raise HTTPException(status_code=401, detail="비밀번호가 틀렸어요")
+
+
+@app.post("/api/admin/login")
+def admin_login(x_admin_password: Optional[str] = Header(None)):
+    _require_admin(x_admin_password)
+    return {"ok": True}
+
+
+@app.post("/api/admin/shades")
+async def admin_add_shade(
+    brand: str = Form(...),
+    name: str = Form(...),
+    verified: bool = Form(...),
+    use_card: bool = Form(True),
+    crops: str = Form(...),
+    files: List[UploadFile] = File(...),
+    x_admin_password: Optional[str] = Header(None),
+):
+    """사진(최대 5장) + 각 사진에서 선택한 크롭 영역으로 색상을 측정해서
+    새 파운데이션 색상을 저장해요. use_card=True 면 사진마다 색상카드를 찾아
+    카메라/조명 보정을 거치고, False 면 크롭 영역의 색을 보정 없이 그대로 써요.
+    여러 장이면 평균을 내요 (원래 Streamlit 버전과 동일한 방식)."""
+    _require_admin(x_admin_password)
+
+    try:
+        crop_boxes = json.loads(crops)
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "message": "crops 형식이 올바르지 않아요"})
+
+    if not isinstance(crop_boxes, list) or len(crop_boxes) != len(files):
+        return JSONResponse(status_code=400, content={"success": False, "message": "사진 개수와 선택 영역 개수가 달라요"})
+
+    labs = []
+    photo_debug = []
+    for f, box in zip(files, crop_boxes):
+        contents = await f.read()
+        arr = np.frombuffer(contents, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            photo_debug.append({"file": f.filename, "error": "이미지를 읽지 못했어요"})
+            continue
+
+        h_img, w_img = bgr.shape[:2]
+        x = max(0, min(int(box.get("x", 0)), w_img - 1))
+        y = max(0, min(int(box.get("y", 0)), h_img - 1))
+        w = max(1, min(int(box.get("w", 1)), w_img - x))
+        h = max(1, min(int(box.get("h", 1)), h_img - y))
+        crop_rgb = cv2.cvtColor(bgr[y : y + h, x : x + w], cv2.COLOR_BGR2RGB)
+        median_rgb = np.median(crop_rgb.reshape(-1, 3), axis=0)
+
+        if use_card:
+            calib = calibrate_from_image(bgr)
+            if not calib.success:
+                photo_debug.append({"file": f.filename, "error": f"색상카드 인식 실패: {calib.message}"})
+                continue
+            corrected_rgb = apply_correction(median_rgb, calib.correction_matrix)
+            lab = rgb_to_lab(corrected_rgb)
+            photo_debug.append(
+                {
+                    "file": f.filename,
+                    "lab": [round(float(v), 2) for v in lab],
+                    "calib_error": round(float(calib.mean_delta_e), 2),
+                }
+            )
+        else:
+            lab = rgb_to_lab(median_rgb)
+            photo_debug.append({"file": f.filename, "lab": [round(float(v), 2) for v in lab]})
+
+        labs.append(lab)
+
+    if not labs:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "사용할 수 있는 사진이 없어요", "photos": photo_debug},
+        )
+
+    mean_lab = np.mean(labs, axis=0)
+    new_shade = {
+        "id": f"{brand}-{name}-{uuid.uuid4().hex[:6]}".lower().replace(" ", "-"),
+        "brand": brand,
+        "name": name,
+        "L": round(float(mean_lab[0]), 3),
+        "a": round(float(mean_lab[1]), 3),
+        "b": round(float(mean_lab[2]), 3),
+        "verified": verified,
+    }
+    try:
+        github_storage.add_shade(new_shade)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": f"저장 실패: {e}"})
+
+    return {"success": True, "message": "저장 완료", "shade": new_shade, "photos": photo_debug}
+
+
+@app.delete("/api/admin/shades/{shade_id}")
+def admin_delete_shade(shade_id: str, x_admin_password: Optional[str] = Header(None)):
+    _require_admin(x_admin_password)
+    try:
+        github_storage.delete_shade(shade_id)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": f"삭제 실패: {e}"})
+    return {"success": True}
+
+
+@app.get("/api/admin/card-reference")
+def admin_get_card_reference(x_admin_password: Optional[str] = Header(None)):
+    _require_admin(x_admin_password)
+    try:
+        data, _sha = github_storage.read_card_reference()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+    return {"success": True, "patches": (data or {}).get("patches") if data else None}
+
+
+@app.post("/api/admin/card-reference/preview")
+async def admin_card_reference_preview(
+    file: UploadFile = File(...),
+    x_admin_password: Optional[str] = Header(None),
+):
+    """카드만 깨끗하게 찍은 사진에서 24개 패치 색을 추출해서 미리보기로
+    보여줘요. 아직 저장은 안 해요 (확인 후 /save 를 따로 호출)."""
+    _require_admin(x_admin_password)
+    contents = await file.read()
+    arr = np.frombuffer(contents, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return JSONResponse(status_code=400, content={"success": False, "message": "이미지를 읽지 못했어요"})
+    ok, msg, patches = capture_card_reference(bgr)
+    if not ok:
+        return JSONResponse(status_code=400, content={"success": False, "message": msg})
+    patches_json = {k: [round(float(c), 1) for c in v] for k, v in patches.items()}
+    return {"success": True, "message": msg, "patches": patches_json}
+
+
+@app.post("/api/admin/card-reference/save")
+def admin_card_reference_save(
+    payload: dict = Body(...),
+    x_admin_password: Optional[str] = Header(None),
+):
+    _require_admin(x_admin_password)
+    try:
+        github_storage.write_card_reference(payload)
+        reference_colors.clear_reference_cache()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+    return {"success": True}
+
+
+@app.delete("/api/admin/card-reference")
+def admin_card_reference_reset(x_admin_password: Optional[str] = Header(None)):
+    _require_admin(x_admin_password)
+    try:
+        github_storage.delete_card_reference()
+        reference_colors.clear_reference_cache()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+    return {"success": True}
 
 
 @app.post("/api/recommend")
