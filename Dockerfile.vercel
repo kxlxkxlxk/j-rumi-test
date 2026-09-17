@@ -1,0 +1,32 @@
+# Vercel이 이 파일을 보고 자동으로 컨테이너를 빌드해요 (직접 Docker를 설치할
+# 필요 없어요 -- 지금까지처럼 GitHub에 파일만 올리면 Vercel이 알아서 빌드).
+#
+# 왜 이 방식으로 바꿨나: mediapipe의 얼굴 인식 기능이 (CPU만 쓰도록 설정
+# 했는데도) 내부적으로 그래픽 관련 시스템 파일(libEGL, libGLES 등)을
+# 찾는데, 기본 Vercel 파이썬 환경에는 이 파일들이 없어요. 이 파일들은
+# pip로 설치할 수 없는 "운영체제" 수준 파일이라, apt-get으로 설치할 수
+# 있는 Docker 컨테이너 방식이 필요해요.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8000
+
+# mediapipe/opencv가 필요로 하는 시스템 파일들 설치.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libegl1 libgles2 libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+COPY src ./src
+COPY data ./data
+COPY models ./models
+
+EXPOSE 8000
+
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port $PORT"]
