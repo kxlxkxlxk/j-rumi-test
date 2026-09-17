@@ -21,12 +21,24 @@ from pathlib import Path
 import numpy as np
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.recommend import recommend_foundation
 from src import github_storage
 
 app = FastAPI()
+
+# 프론트엔드(Next.js, 다른 Vercel 프로젝트)에서 이 API를 호출할 수 있도록 허용.
+# 지금은 별도 프로젝트로 나눠서 배포하기 때문에 이 설정이 없으면 브라우저가
+# 보안상 요청을 막아버려요 (CORS 오류).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 LOCAL_DB_PATH = Path(__file__).parent / "data" / "foundation_db.json"
 
